@@ -5,6 +5,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from agent.state import AgentState
 from database.schema_rag import get_relevant_schemas
 from database.connection import execute_query
+from database.query_rag import get_few_shot_examples
 
 load_dotenv()
 
@@ -17,26 +18,35 @@ llm = ChatOpenAI(
 )
 
 def retrieve_schema(state: AgentState) -> dict:
-    """Node 1: Retrieves only the necessary table schemas using our FAISS RAG system."""
-    print("-> [Node: retrieve_schema] Finding relevant tables...")
+    """Node 1: Retrieves necessary table schemas AND historical Golden SQL examples."""
+    print("-> [Node: retrieve_schema] Finding relevant tables and historical examples...")
     query = state["user_query"]
+    
     schemas = get_relevant_schemas(query, k=3)
-    return {"schemas": schemas}
+    examples = get_few_shot_examples(query, k=2)
+    
+    return {
+        "schemas": schemas, 
+        "few_shot_examples": examples
+    }
 
 def generate_sql(state: AgentState) -> dict:
-    """Node 2: Generates the PostgreSQL query. If it failed previously, it self-corrects."""
+    """Node 2: Generates the PostgreSQL query using Schemas and Few-Shot Examples."""
     print("-> [Node: generate_sql] Writing PostgreSQL query...")
     query = state["user_query"]
     schemas = state["schemas"]
+    examples = state.get("few_shot_examples", "")
     error = state.get("execution_error")
 
-    # The prompt dynamically changes if the agent is in a self-correction loop
+    # The prompt now dynamically injects the Golden Queries
     prompt_str = """You are an expert Data Engineer writing PostgreSQL queries.
     Based on the following user request and database schemas, write a valid PostgreSQL query.
     Return ONLY the raw SQL query. Do not wrap it in markdown block quotes. Do not explain it.
     
     Schemas:
     {schemas}
+    
+    {examples}
     
     User Request: {query}
     """
@@ -47,13 +57,16 @@ def generate_sql(state: AgentState) -> dict:
     prompt = ChatPromptTemplate.from_template(prompt_str)
     chain = prompt | llm
     
-    response = chain.invoke({"schemas": schemas, "query": query})
+    # We must pass the new 'examples' variable into the chain invocation
+    response = chain.invoke({
+        "schemas": schemas, 
+        "examples": examples, 
+        "query": query
+    })
     
-    # Strip any accidental markdown formatting the LLM might include
     sql = response.content.strip().replace("```sql", "").replace("```", "").strip()
     
     return {"generated_sql": sql, "execution_error": None}
-
 def check_approval(state: AgentState) -> dict:
     """Node 3: Human-in-the-Loop Security. Detects if the query modifies data."""
     sql = state.get("generated_sql", "").strip().upper()

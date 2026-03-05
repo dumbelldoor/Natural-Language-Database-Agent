@@ -10,6 +10,7 @@ class AgentState(TypedDict):
     
     # 2. RAG Context
     schemas: str
+    few_shot_examples: str
     
     # 3. Generation & Self-Correction
     generated_sql: str
