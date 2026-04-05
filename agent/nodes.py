@@ -1,20 +1,22 @@
 import os
+import re
+import json
 from dotenv import load_dotenv
+load_dotenv(override=True) # This forces Python to use the newly saved token
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from agent.state import AgentState
 from database.schema_rag import get_relevant_schemas
 from database.connection import execute_query
 from database.query_rag import get_few_shot_examples
+from config import LLM_CONFIG
 
-load_dotenv()
-
-# Initialize Llama 3.3 70B using the free GitHub Models OpenAI-compatible endpoint
+# Initialize LLM using dynamically loaded configurations
 llm = ChatOpenAI(
-    model="llama-3.3-70b-instruct",
+    model=LLM_CONFIG.get("model", "llama-3.3-70b-instruct"),
     api_key=os.getenv("GITHUB_TOKEN"),
-    base_url="https://models.inference.ai.azure.com", 
-    temperature=0, # Temperature 0 ensures deterministic, precise SQL generation
+    base_url=LLM_CONFIG.get("base_url", "https://models.inference.ai.azure.com"), 
+    temperature=LLM_CONFIG.get("temperature", 0.0),
 )
 
 def retrieve_schema(state: AgentState) -> dict:
@@ -68,17 +70,26 @@ def generate_sql(state: AgentState) -> dict:
     
     return {"generated_sql": sql, "execution_error": None}
 def check_approval(state: AgentState) -> dict:
-    """Node 3: Human-in-the-Loop Security. Detects if the query modifies data."""
-    sql = state.get("generated_sql", "").strip().upper()
+    """Node 3: Human-in-the-Loop Security. Detects if the query modifies data using rigorous regex and verifies syntax with a dry-run."""
+    sql = state.get("generated_sql", "").strip()
     
-    # FIX: Check if modifying keywords exist ANYWHERE in the query, 
-    # not just at the start, to catch CTEs and queries with comments.
-    modifying_keywords = ["INSERT ", "UPDATE ", "DELETE ", "CREATE ", "DROP ", "ALTER "]
-    is_modifying = any(kw in sql for kw in modifying_keywords)
+    # Use rigorous Regex with word boundaries for Modifying Keywords
+    modifying_keywords_pattern = re.compile(r'\b(INSERT|UPDATE|DELETE|CREATE|DROP|ALTER|TRUNCATE|REPLACE|GRANT|REVOKE)\b', re.IGNORECASE)
+    is_modifying = bool(modifying_keywords_pattern.search(sql))
     
     if is_modifying and not state.get("is_approved"):
-        print("-> [Node: check_approval] WARNING: Modifying query detected. Pausing for Human Approval.")
-        return {"requires_approval": True}
+        print("-> [Node: check_approval] WARNING: Modifying query detected. Verifying syntactically via dry-run...")
+        # Run a Dry-Run Transaction to verify safe syntax before presenting to user
+        from database.connection import dry_run_query
+        dry_run_result = dry_run_query(sql)
+        
+        if dry_run_result.get("status") == "error":
+            print(f"-> [Node: check_approval] Dry run revealed SQL error ({dry_run_result['message']}). Bypassing human approval to allow auto-correction.")
+            return {"requires_approval": False} # The execute_sql node will fail this query and auto-correct!
+            
+        print("-> [Node: check_approval] Dry-run passed safely. Pausing for Human Approval.")
+        state["generated_sql"] = f"-- {dry_run_result.get('message', 'Dry run successful')}\n" + sql 
+        return {"requires_approval": True, "generated_sql": state["generated_sql"]}
     
     return {"requires_approval": False}
 
@@ -133,7 +144,14 @@ def generate_final_response(state: AgentState) -> dict:
         The database returned this raw data: {results} {truncation_note}
         
         Provide a clear, concise, natural language summary of the results. 
-        Do not mention SQL or database metrics. Just give the final answer."""
+        Do not mention SQL or database metrics. Just give the final answer.
+        
+        IMPORTANT DASHBOARD INSTRUCTION:
+        If the data returned contains trends over time, categorical comparisons, or numerical distributions that would visually benefit from a chart, you MUST append a JSON block at the very end of your response formatted exactly like this:
+        ```json
+        {{"chart_type": "bar", "x": "column_name", "y": "column_name"}}
+        ```
+        Allowed chart_types: "bar", "line", "scatter". Choose the single best one. Do NOT include this JSON if the data is a single value or text that cannot be meaningfully charted."""
     )
     chain = prompt | llm
     
@@ -144,7 +162,20 @@ def generate_final_response(state: AgentState) -> dict:
         "truncation_note": truncation_note
     })
     
-    return {"final_answer": response.content}
+    content = response.content
+    chart_config = None
+    
+    # Parse out the optional chart_config JSON block
+    match = re.search(r'```json\s*(\{.*?\})\s*```', content, re.DOTALL | re.IGNORECASE)
+    if match:
+        try:
+            chart_config = json.loads(match.group(1))
+            content = content[:match.start()].strip() # Clean the UI response
+            print("-> [Node: generate_final_response] Chart Config extracted successfully.")
+        except Exception as e:
+            print(f"-> [Node: generate_final_response] Could not parse chart JSON: {e}")
+            
+    return {"final_answer": content, "chart_config": chart_config}
 # --- TEST BLOCK ---
 if __name__ == "__main__":
     print("\nTesting LLM Connection and Node Logic...")

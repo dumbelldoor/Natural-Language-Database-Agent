@@ -3,9 +3,10 @@ import os
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_core.documents import Document
+from config import RAG_CONFIG
 
-# Use the exact same CPU-friendly embedding model as our schema RAG
-EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+# Initialize Embedding model via central config
+EMBEDDING_MODEL = RAG_CONFIG.get("embedding_model", "sentence-transformers/all-MiniLM-L6-v2")
 GOLDEN_QUERIES_PATH = os.path.join(os.path.dirname(__file__), "golden_queries.json")
 
 def create_golden_vector_store():

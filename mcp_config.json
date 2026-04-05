@@ -1,0 +1,15 @@
+{
+  "llm": {
+    "model": "llama-3.3-70b-instruct",
+    "base_url": "https://models.inference.ai.azure.com",
+    "temperature": 0.0
+  },
+  "database": {
+    "host": "localhost",
+    "port": "5432",
+    "dbname": "mcp_agent_db"
+  },
+  "rag": {
+    "embedding_model": "sentence-transformers/all-MiniLM-L6-v2"
+  }
+}
