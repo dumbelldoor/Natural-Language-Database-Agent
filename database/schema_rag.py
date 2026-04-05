@@ -3,9 +3,10 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 from database.connection import engine
+from config import RAG_CONFIG
 
-# We use a lightweight, free HuggingFace model that runs perfectly on Mac CPUs
-EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+# Initialize Embedding model via central config
+EMBEDDING_MODEL = RAG_CONFIG.get("embedding_model", "sentence-transformers/all-MiniLM-L6-v2")
 embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
 
 def extract_database_schema() -> list[Document]:

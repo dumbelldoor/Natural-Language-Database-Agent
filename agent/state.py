@@ -25,3 +25,6 @@ class AgentState(TypedDict):
     final_results: Optional[List[dict[str, Any]]]
     execution_metrics: Optional[List[str]]
     final_answer: str
+    
+    # 6. Dashboard / Visualization
+    chart_config: Optional[dict[str, Any]]

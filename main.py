@@ -28,6 +28,29 @@ for msg in st.session_state.messages:
                     st.write("**Performance Metrics:**")
                     for metric in msg["metrics"]:
                         st.text(metric)
+                        
+        # Render dynamic dashboard charts if available
+        if "chart_config" in msg and msg["chart_config"] and "data" in msg and msg["data"]:
+            try:
+                df = pd.DataFrame(msg["data"])
+                # Safely convert Decimals and complex objects to floats so Streamlit/Altair can interpret them quantitatively
+                for col in df.columns:
+                    try:
+                        df[col] = pd.to_numeric(df[col])
+                    except Exception:
+                        pass
+                
+                cfg = msg["chart_config"]
+                if cfg.get("x") in df.columns and cfg.get("y") in df.columns:
+                    df_chart = df.set_index(cfg["x"])
+                    if cfg.get("chart_type") == "bar":
+                        st.bar_chart(df_chart[[cfg["y"]]])
+                    elif cfg.get("chart_type") == "line":
+                        st.line_chart(df_chart[[cfg["y"]]])
+                    elif cfg.get("chart_type") == "scatter":
+                        st.scatter_chart(df_chart[[cfg["y"]]])
+            except Exception:
+                pass
 
 # --- Handle Human-In-The-Loop (HITL) Approval ---
 # If the graph paused because it needs human approval for a modifying query
@@ -83,6 +106,30 @@ elif prompt := st.chat_input("Ask a question about your database (e.g., 'What ar
             answer = result_state.get("final_answer", "Sorry, I couldn't process that.")
             st.markdown(answer)
             
+            # Dynamically render charts if AI requested it
+            chart_config = result_state.get("chart_config")
+            data = result_state.get("final_results")
+            if chart_config and data:
+                try:
+                    df = pd.DataFrame(data)
+                    # Safely convert Decimals and complex objects to floats so Streamlit/Altair can interpret them quantitatively
+                    for col in df.columns:
+                        try:
+                            df[col] = pd.to_numeric(df[col])
+                        except Exception:
+                            pass
+                    
+                    if chart_config.get("x") in df.columns and chart_config.get("y") in df.columns:
+                        df_chart = df.set_index(chart_config["x"])
+                        if chart_config.get("chart_type") == "bar":
+                            st.bar_chart(df_chart[[chart_config["y"]]])
+                        elif chart_config.get("chart_type") == "line":
+                            st.line_chart(df_chart[[chart_config["y"]]])
+                        elif chart_config.get("chart_type") == "scatter":
+                            st.scatter_chart(df_chart[[chart_config["y"]]])
+                except Exception as e:
+                    st.warning(f"Failed to render chart: {e}")
+            
             # Display the slick expander with SQL and Performance Metrics
             with st.expander("🔍 View Database Execution Details"):
                 st.code(result_state.get("generated_sql"), language="sql")
@@ -97,5 +144,7 @@ elif prompt := st.chat_input("Ask a question about your database (e.g., 'What ar
                 "role": "assistant", 
                 "content": answer,
                 "sql": result_state.get("generated_sql"),
-                "metrics": metrics
+                "metrics": metrics,
+                "chart_config": chart_config,
+                "data": data
             })
