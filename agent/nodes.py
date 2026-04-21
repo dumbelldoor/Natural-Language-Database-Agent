@@ -114,7 +114,7 @@ def execute_sql(state: AgentState) -> dict:
     # FIX: If it's an UPDATE/INSERT, there is no 'data', just a 'message'. 
     # We must pass this message to the LLM so it knows the action succeeded.
     final_data = result.get("data")
-    if not final_data:
+    if final_data is None:
         final_data = [{"database_response": result.get("message", "Action executed successfully.")}]
     
     return {
