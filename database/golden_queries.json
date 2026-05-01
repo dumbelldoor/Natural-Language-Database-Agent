@@ -1,22 +1,50 @@
 [
   {
-    "natural_language_query": "Find the top 5 users who have spent the most money specifically on 'Electronics', including their total spend and email address.",
-    "sql_query": "SELECT u.email, SUM(oi.quantity * oi.unit_price) AS total_electronics_spend FROM users u JOIN orders o ON u.user_id = o.user_id JOIN order_items oi ON o.order_id = oi.order_id JOIN products p ON oi.product_id = p.product_id JOIN categories c ON p.category_id = c.category_id WHERE c.category_name = 'Electronics' AND o.status = 'Delivered' GROUP BY u.user_id, u.email ORDER BY total_electronics_spend DESC LIMIT 5;"
+    "natural_language_query": "Who are the top 10 customers by total amount spent?",
+    "sql_query": "SELECT u.first_name, u.last_name, u.email, ROUND(SUM(o.total_amount), 2) AS total_spent FROM users u JOIN orders o ON u.user_id = o.user_id WHERE o.status = 'Delivered' GROUP BY u.user_id, u.first_name, u.last_name, u.email ORDER BY total_spent DESC LIMIT 10;"
   },
   {
-    "natural_language_query": "List all currently active users who have placed at least one order in the last 6 months but have NEVER bought anything from the 'Clothing' category.",
-    "sql_query": "WITH ClothingBuyers AS (SELECT DISTINCT o.user_id FROM orders o JOIN order_items oi ON o.order_id = oi.order_id JOIN products p ON oi.product_id = p.product_id JOIN categories c ON p.category_id = c.category_id WHERE c.category_name = 'Clothing') SELECT u.user_id, u.email, u.first_name, u.last_name FROM users u JOIN orders o ON u.user_id = o.user_id WHERE u.is_active = TRUE AND o.order_date >= CURRENT_DATE - INTERVAL '6 months' AND u.user_id NOT IN (SELECT user_id FROM ClothingBuyers) GROUP BY u.user_id, u.email, u.first_name, u.last_name;"
+    "natural_language_query": "What is the monthly revenue for the year 2024?",
+    "sql_query": "SELECT TO_CHAR(DATE_TRUNC('month', order_date), 'YYYY-MM') AS month, ROUND(SUM(total_amount), 2) AS revenue FROM orders WHERE EXTRACT(YEAR FROM order_date) = 2024 AND status = 'Delivered' GROUP BY DATE_TRUNC('month', order_date) ORDER BY month;"
   },
   {
-    "natural_language_query": "Rank the top 3 best-selling products (by total quantity sold) within each individual category.",
-    "sql_query": "WITH ProductSales AS (SELECT p.category_id, p.product_name, SUM(oi.quantity) AS total_sold, ROW_NUMBER() OVER(PARTITION BY p.category_id ORDER BY SUM(oi.quantity) DESC) as rank FROM products p JOIN order_items oi ON p.product_id = oi.product_id JOIN orders o ON oi.order_id = o.order_id WHERE o.status != 'Pending' GROUP BY p.category_id, p.product_name) SELECT c.category_name, ps.product_name, ps.total_sold, ps.rank FROM ProductSales ps JOIN categories c ON ps.category_id = c.category_id WHERE ps.rank <= 3 ORDER BY c.category_name, ps.rank;"
+    "natural_language_query": "What are the best-selling products by total quantity sold in each category?",
+    "sql_query": "WITH ranked AS (SELECT c.category_name, p.product_name, SUM(oi.quantity) AS total_sold, ROW_NUMBER() OVER (PARTITION BY c.category_id ORDER BY SUM(oi.quantity) DESC) AS rank FROM products p JOIN subcategories sc ON p.subcategory_id = sc.subcategory_id JOIN categories c ON sc.category_id = c.category_id JOIN order_items oi ON p.product_id = oi.product_id JOIN orders o ON oi.order_id = o.order_id WHERE o.status != 'Cancelled' GROUP BY c.category_id, c.category_name, p.product_id, p.product_name) SELECT category_name, product_name, total_sold, rank FROM ranked WHERE rank <= 5 ORDER BY category_name, rank;"
   },
   {
-    "natural_language_query": "What is the month-over-month total revenue growth for the year 2024?",
-    "sql_query": "WITH MonthlyRevenue AS (SELECT DATE_TRUNC('month', order_date) AS order_month, SUM(total_amount) AS revenue FROM orders WHERE EXTRACT(YEAR FROM order_date) = 2024 AND status = 'Delivered' GROUP BY DATE_TRUNC('month', order_date)) SELECT order_month, revenue, LAG(revenue) OVER (ORDER BY order_month) AS previous_month_revenue, ROUND(((revenue - LAG(revenue) OVER (ORDER BY order_month)) / LAG(revenue) OVER (ORDER BY order_month)) * 100, 2) AS mom_growth_percentage FROM MonthlyRevenue ORDER BY order_month;"
+    "natural_language_query": "Show me the month-over-month revenue growth percentage",
+    "sql_query": "WITH monthly AS (SELECT DATE_TRUNC('month', order_date) AS month, SUM(total_amount) AS revenue FROM orders WHERE status = 'Delivered' GROUP BY 1) SELECT TO_CHAR(month, 'YYYY-MM') AS month, ROUND(revenue, 2) AS revenue, ROUND(LAG(revenue) OVER (ORDER BY month), 2) AS prev_revenue, ROUND(((revenue - LAG(revenue) OVER (ORDER BY month)) / NULLIF(LAG(revenue) OVER (ORDER BY month), 0)) * 100, 2) AS growth_pct FROM monthly ORDER BY month;"
   },
   {
-    "natural_language_query": "Show me the average order value (AOV) and total number of orders for users, grouped by their signup year.",
-    "sql_query": "SELECT EXTRACT(YEAR FROM u.signup_date) AS signup_year, COUNT(DISTINCT o.order_id) AS total_orders, ROUND(AVG(o.total_amount), 2) AS average_order_value FROM users u JOIN orders o ON u.user_id = o.user_id WHERE o.status != 'Pending' GROUP BY EXTRACT(YEAR FROM u.signup_date) ORDER BY signup_year DESC;"
+    "natural_language_query": "What is the average order value grouped by the year users signed up?",
+    "sql_query": "SELECT EXTRACT(YEAR FROM u.signup_date) AS signup_year, COUNT(DISTINCT o.order_id) AS total_orders, ROUND(AVG(o.total_amount), 2) AS avg_order_value FROM users u JOIN orders o ON u.user_id = o.user_id WHERE o.status != 'Pending' GROUP BY EXTRACT(YEAR FROM u.signup_date) ORDER BY signup_year DESC;"
+  },
+  {
+    "natural_language_query": "Find active users who have never placed an order",
+    "sql_query": "SELECT u.user_id, u.first_name, u.last_name, u.email, u.signup_date FROM users u LEFT JOIN orders o ON u.user_id = o.user_id WHERE u.is_active = TRUE AND o.order_id IS NULL ORDER BY u.signup_date DESC;"
+  },
+  {
+    "natural_language_query": "What are the top 5 suppliers by total revenue from their products?",
+    "sql_query": "SELECT s.company_name, ROUND(SUM(oi.quantity * oi.unit_price), 2) AS total_revenue FROM suppliers s JOIN products p ON s.supplier_id = p.supplier_id JOIN order_items oi ON p.product_id = oi.product_id JOIN orders o ON oi.order_id = o.order_id WHERE o.status = 'Delivered' GROUP BY s.supplier_id, s.company_name ORDER BY total_revenue DESC LIMIT 5;"
+  },
+  {
+    "natural_language_query": "How many orders are there per status type?",
+    "sql_query": "SELECT status, COUNT(*) AS order_count, ROUND(100.0 * COUNT(*) / SUM(COUNT(*)) OVER (), 2) AS percentage FROM orders GROUP BY status ORDER BY order_count DESC;"
+  },
+  {
+    "natural_language_query": "What is the average product rating for each category?",
+    "sql_query": "SELECT c.category_name, ROUND(AVG(pr.rating), 2) AS avg_rating, COUNT(pr.review_id) AS total_reviews FROM categories c JOIN subcategories sc ON c.category_id = sc.category_id JOIN products p ON sc.subcategory_id = p.subcategory_id JOIN product_reviews pr ON p.product_id = pr.product_id GROUP BY c.category_id, c.category_name ORDER BY avg_rating DESC;"
+  },
+  {
+    "natural_language_query": "Show me total revenue and order count for each country",
+    "sql_query": "SELECT u.country, COUNT(DISTINCT o.order_id) AS total_orders, ROUND(SUM(o.total_amount), 2) AS total_revenue FROM users u JOIN orders o ON u.user_id = o.user_id WHERE o.status = 'Delivered' GROUP BY u.country ORDER BY total_revenue DESC LIMIT 20;"
+  },
+  {
+    "natural_language_query": "Which departments have the highest average employee salary?",
+    "sql_query": "SELECT d.department_name, COUNT(e.employee_id) AS employee_count, ROUND(AVG(e.salary), 2) AS avg_salary, ROUND(MAX(e.salary), 2) AS max_salary FROM departments d JOIN employees e ON d.department_id = e.department_id GROUP BY d.department_id, d.department_name ORDER BY avg_salary DESC;"
+  },
+  {
+    "natural_language_query": "What products have low stock? Show products with less than 20 units",
+    "sql_query": "SELECT p.product_name, p.stock_quantity, p.price, s.company_name AS supplier FROM products p JOIN suppliers s ON p.supplier_id = s.supplier_id WHERE p.stock_quantity < 20 ORDER BY p.stock_quantity ASC LIMIT 50;"
   }
 ]
