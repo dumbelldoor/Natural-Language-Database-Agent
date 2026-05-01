@@ -25,10 +25,6 @@ llm = ChatOpenAI(
 
 # ─── Retry helper ─────────────────────────────────────────────
 def _invoke_with_retry(chain, inputs: dict, max_retries: int = 3, base_delay: float = 2.0):
-    """
-    Invoke a LangChain chain with exponential backoff on transient errors.
-    Retries on rate-limits (429), server errors (5xx) and connection issues.
-    """
     for attempt in range(max_retries):
         try:
             return chain.invoke(inputs)
@@ -37,20 +33,20 @@ def _invoke_with_retry(chain, inputs: dict, max_retries: int = 3, base_delay: fl
             is_transient = any(code in err for code in ["429", "500", "502", "503", "timeout", "connection"])
             if is_transient and attempt < max_retries - 1:
                 wait = base_delay * (2 ** attempt)
-                print(f"-> [Retry] Attempt {attempt + 1}/{max_retries} failed ({err[:60]}). Retrying in {wait:.0f}s…")
+                print(f"-> [Retry] Attempt {attempt + 1}/{max_retries} failed ({err[:60]}). Retrying in {wait:.0f}s...")
                 time.sleep(wait)
             else:
                 raise
     raise RuntimeError("Max retries exceeded")
 
 # ─── Prompts ──────────────────────────────────────────────────
-_SQL_SYSTEM = """You are an expert PostgreSQL query writer. Your ONLY job is to produce a single, \
+_SQL_SYSTEM_POSTGRES = """You are an expert PostgreSQL query writer. Your ONLY job is to produce a single, \
 correct, executable PostgreSQL statement.
 
 STRICT OUTPUT RULES:
 - Output ONLY the raw SQL. No markdown fences, no explanation, no preamble.
 - End the query with a semicolon.
-- Use exact table and column names from the schemas — never invent names.
+- Use exact table and column names from the schemas -- never invent names.
 - Use JOIN conditions based on the Foreign Keys listed in each schema.
 - GROUP BY every non-aggregate SELECT column.
 - Default LIMIT 500 unless the user specifies otherwise.
@@ -58,23 +54,35 @@ STRICT OUTPUT RULES:
 - Use ROUND(..., 2) for monetary values.
 - Use DATE_TRUNC / EXTRACT / TO_CHAR for date formatting."""
 
+_SQL_SYSTEM_DUCK = """You are an expert SQL query writer using DuckDB syntax. Your ONLY job is to produce a \
+single, correct, executable SQL statement against the user-uploaded dataset.
+
+STRICT OUTPUT RULES:
+- Output ONLY the raw SQL. No markdown fences, no explanation, no preamble.
+- End the query with a semicolon.
+- Use EXACT table and column names from the schema -- never invent names.
+- GROUP BY every non-aggregate SELECT column.
+- Default LIMIT 500 unless the user specifies otherwise.
+- Use LOWER() for case-insensitive string comparisons.
+- Use ROUND(..., 2) for numeric values."""
+
 _SQL_HUMAN = """DATABASE SCHEMAS (columns + foreign keys):
 {schemas}
 
 {examples}USER QUESTION: {query}
 {error_block}
-Write the PostgreSQL query now:"""
+Write the SQL query now:"""
 
 _RESPONSE_SYSTEM = """You are a friendly data analyst presenting database query results to a business user.
 
 RULES:
-1. Answer the user's question directly in plain English — no SQL, no technical jargon.
+1. Answer the user's question directly in plain English -- no SQL, no technical jargon.
 2. If the result contains a table of rows, include a clean markdown table (max 20 rows shown).
 3. Bold (**) the most important number or insight.
-4. Keep prose concise: 1–3 sentences of summary around the table.
-5. Do NOT repeat every row in prose — let the table speak.
+4. Keep prose concise: 1-3 sentences of summary around the table.
+5. Do NOT repeat every row in prose -- let the table speak.
 
-CHART RULE — append this JSON block at the very end (nothing after it) if the data has \
+CHART RULE -- append this JSON block at the very end (nothing after it) if the data has \
 trends, rankings or comparisons that would benefit from a chart:
 ```json
 {{"chart_type": "bar", "x": "column_name", "y": "column_name"}}
@@ -85,17 +93,20 @@ Allowed types: "bar", "line", "scatter". Omit the block for single-value or text
 # ─── Nodes ────────────────────────────────────────────────────
 
 def retrieve_schema(state: AgentState) -> dict:
-    """Node 1: Fetch relevant table schemas + few-shot examples."""
-    print("-> [retrieve_schema] Finding relevant tables…")
-    query = state["user_query"]
+    if state.get("data_source") == "upload":
+        return {"few_shot_examples": ""}
+    print("-> [retrieve_schema] Finding relevant tables...")
+    query    = state["user_query"]
     schemas  = get_relevant_schemas(query, k=6)
     examples = get_few_shot_examples(query, k=2)
     return {"schemas": schemas, "few_shot_examples": examples}
 
 
 def generate_sql(state: AgentState) -> dict:
-    """Node 2: Generate a PostgreSQL query with LLM (retry-safe)."""
-    print("-> [generate_sql] Writing query…")
+    print("-> [generate_sql] Writing query...")
+    is_upload     = state.get("data_source") == "upload"
+    system_prompt = _SQL_SYSTEM_DUCK if is_upload else _SQL_SYSTEM_POSTGRES
+
     query    = state["user_query"]
     schemas  = state["schemas"]
     examples = state.get("few_shot_examples", "")
@@ -108,17 +119,13 @@ def generate_sql(state: AgentState) -> dict:
     error_block = ""
     if error:
         print(f"-> [Self-Correction] Previous error: {error}")
-        error_block = (
-            f"\nPREVIOUS ATTEMPT FAILED:\n{error}\n"
-            "Fix the query. Do not repeat the same mistake."
-        )
+        error_block = f"\nPREVIOUS ATTEMPT FAILED:\n{error}\nFix the query. Do not repeat the same mistake."
 
     prompt = ChatPromptTemplate.from_messages([
-        ("system", _SQL_SYSTEM),
+        ("system", system_prompt),
         ("human",  _SQL_HUMAN),
     ])
-    chain = prompt | llm
-
+    chain    = prompt | llm
     response = _invoke_with_retry(chain, {
         "schemas":     schemas,
         "examples":    examples_block,
@@ -129,14 +136,14 @@ def generate_sql(state: AgentState) -> dict:
     sql = response.content.strip()
     sql = re.sub(r"^```(?:sql)?\s*", "", sql, flags=re.IGNORECASE)
     sql = re.sub(r"\s*```$", "", sql).strip()
-
     return {"generated_sql": sql, "execution_error": None}
 
 
 def check_approval(state: AgentState) -> dict:
-    """Node 3: HITL — detect & dry-run modifying queries."""
-    sql = state.get("generated_sql", "").strip()
+    if state.get("data_source") == "upload":
+        return {"requires_approval": False}
 
+    sql = state.get("generated_sql", "").strip()
     modifying = re.compile(
         r'\b(INSERT|UPDATE|DELETE|CREATE|DROP|ALTER|TRUNCATE|REPLACE|GRANT|REVOKE)\b',
         re.IGNORECASE
@@ -144,12 +151,11 @@ def check_approval(state: AgentState) -> dict:
     if not modifying.search(sql) or state.get("is_approved"):
         return {"requires_approval": False}
 
-    print("-> [check_approval] Modifying query detected. Dry-running…")
+    print("-> [check_approval] Modifying query detected. Dry-running...")
     from database.connection import dry_run_query
     result = dry_run_query(sql)
 
     if result.get("status") == "error":
-        print(f"-> [check_approval] Dry-run failed — routing to self-correction.")
         return {"requires_approval": False}
 
     annotated = f"-- {result.get('message', 'Dry run OK')}\n{sql}"
@@ -157,15 +163,18 @@ def check_approval(state: AgentState) -> dict:
 
 
 def execute_sql(state: AgentState) -> dict:
-    """Node 4: Execute the SQL query against PostgreSQL."""
     if state.get("requires_approval") and not state.get("is_approved"):
         return {}
 
-    print("-> [execute_sql] Executing query…")
+    print("-> [execute_sql] Executing query...")
     sql      = state["generated_sql"]
     attempts = state.get("correction_attempts", 0)
 
-    result = execute_query(sql, include_explain=True)
+    if state.get("data_source") == "upload":
+        from database.duck_executor import execute_duck_query
+        result = execute_duck_query(state.get("upload_session_id", ""), sql)
+    else:
+        result = execute_query(sql, include_explain=True)
 
     if result["status"] == "error":
         print(f"-> [execute_sql] DB error: {result['message']}")
@@ -173,17 +182,16 @@ def execute_sql(state: AgentState) -> dict:
 
     data = result.get("data") or [{"result": result.get("message", "Executed successfully.")}]
     return {
-        "final_results":    data,
+        "final_results":     data,
         "execution_metrics": result.get("execution_plan", []),
-        "execution_error":  None,
+        "execution_error":   None,
     }
 
 
 def generate_final_response(state: AgentState) -> dict:
-    """Node 5: Translate raw results into a natural-language answer."""
-    print("-> [generate_final_response] Drafting response…")
-    query   = state["user_query"]
-    error   = state.get("execution_error")
+    print("-> [generate_final_response] Drafting response...")
+    query = state["user_query"]
+    error = state.get("execution_error")
 
     if error and state.get("correction_attempts", 0) >= 3:
         return {
@@ -198,7 +206,6 @@ def generate_final_response(state: AgentState) -> dict:
     results    = state.get("final_results", [])
     total_rows = len(results)
     trunc_note = ""
-
     if total_rows > 20:
         results    = results[:20]
         trunc_note = f"\n\n> **Note:** Showing first 20 of **{total_rows}** total rows."
@@ -207,8 +214,7 @@ def generate_final_response(state: AgentState) -> dict:
         ("system", _RESPONSE_SYSTEM),
         ("human",  "USER QUESTION: {query}\n\nDATA ({row_count} rows):\n{results}{trunc_note}"),
     ])
-    chain = prompt | llm
-
+    chain    = prompt | llm
     response = _invoke_with_retry(chain, {
         "query":      query,
         "row_count":  total_rows,
@@ -224,7 +230,6 @@ def generate_final_response(state: AgentState) -> dict:
         try:
             chart_config = json.loads(match.group(1))
             content      = content[:match.start()].strip()
-            print("-> [generate_final_response] Chart config extracted.")
         except Exception as e:
             print(f"-> [generate_final_response] Chart parse failed: {e}")
 

@@ -1,30 +1,28 @@
 from typing import TypedDict, Optional, Any, List
 
 class AgentState(TypedDict):
-    """
-    This defines the memory/state of our LangGraph agent.
-    Every node in the graph will read and update these variables.
-    """
-    # 1. Input
+    # Input
     user_query: str
-    
-    # 2. RAG Context
+
+    # Data source: "postgres" (default) or "upload" (user-provided file via DuckDB)
+    data_source: str
+    upload_session_id: Optional[str]
+
+    # RAG Context
     schemas: str
     few_shot_examples: str
-    
-    # 3. Generation & Self-Correction
+
+    # Generation & Self-Correction
     generated_sql: str
     execution_error: Optional[str]
     correction_attempts: int
-    
-    # 4. Human-In-The-Loop (HITL) Security
+
+    # Human-In-The-Loop (HITL) Security
     requires_approval: bool
     is_approved: bool
-    
-    # 5. Output Data & Metrics
+
+    # Output
     final_results: Optional[List[dict[str, Any]]]
     execution_metrics: Optional[List[str]]
     final_answer: str
-    
-    # 6. Dashboard / Visualization
     chart_config: Optional[dict[str, Any]]
