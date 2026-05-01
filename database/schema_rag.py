@@ -130,14 +130,18 @@ def get_full_schema_text() -> str:
     return "\n\n".join(doc.page_content for doc in docs)
 
 
-print("Initializing schema vector store...")
-schema_vector_store = create_schema_vector_store()
+_schema_vector_store = None
+
+
+def _get_store() -> FAISS:
+    global _schema_vector_store
+    if _schema_vector_store is None:
+        print("Initializing schema vector store (lazy)...")
+        _schema_vector_store = create_schema_vector_store()
+    return _schema_vector_store
 
 
 def get_relevant_schemas(user_query: str, k: int = 6) -> str:
-    """
-    Returns the DDL + FK context for the top-k most relevant tables.
-    Uses k=6 by default to cover complex multi-table joins.
-    """
-    results = schema_vector_store.similarity_search(user_query, k=k)
+    """Returns DDL + FK context for the top-k most relevant tables."""
+    results = _get_store().similarity_search(user_query, k=k)
     return "\n\n".join(doc.page_content for doc in results)

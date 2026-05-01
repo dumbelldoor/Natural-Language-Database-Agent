@@ -33,11 +33,19 @@ def create_golden_vector_store() -> FAISS:
     return FAISS.from_documents(documents, embeddings)
 
 
-golden_vector_store = create_golden_vector_store()
+_golden_vector_store = None
+
+
+def _get_store() -> FAISS:
+    global _golden_vector_store
+    if _golden_vector_store is None:
+        print("Initializing golden query vector store (lazy)...")
+        _golden_vector_store = create_golden_vector_store()
+    return _golden_vector_store
 
 
 def get_few_shot_examples(user_query: str, k: int = 2) -> str:
-    results = golden_vector_store.similarity_search(user_query, k=k)
+    results = _get_store().similarity_search(user_query, k=k)
 
     if not results:
         return "No historical examples found."

@@ -4,22 +4,23 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
 from config import DB_CONFIG
 
-# Still load credentials securely from env, but map non-secrets from config
-DB_USER = os.getenv("DB_USER")
-DB_PASSWORD = os.getenv("DB_PASSWORD", "")
+load_dotenv(override=True)
 
-DB_HOST = DB_CONFIG.get("host", "localhost")
-DB_PORT = DB_CONFIG.get("port", "5432")
-DB_NAME = DB_CONFIG.get("dbname", "mcp_agent_db")
+# Use DATABASE_URL env var if set (Render/Neon/cloud), otherwise build from components (local dev)
+_url = os.getenv("DATABASE_URL")
+if not _url:
+    DB_USER     = os.getenv("DB_USER", "")
+    DB_PASSWORD = os.getenv("DB_PASSWORD", "")
+    DB_HOST     = DB_CONFIG.get("host", "localhost")
+    DB_PORT     = DB_CONFIG.get("port", "5432")
+    DB_NAME     = DB_CONFIG.get("dbname", "mcp_agent_db")
+    _url = (
+        f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+        if DB_PASSWORD
+        else f"postgresql://{DB_USER}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+    )
 
-# Construct the PostgreSQL connection string
-if DB_PASSWORD:
-    DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
-else:
-    DATABASE_URL = f"postgresql://{DB_USER}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
-
-# Create the SQLAlchemy engine
-engine = create_engine(DATABASE_URL)
+engine = create_engine(_url)
 
 def execute_query(query: str, include_explain: bool = False) -> dict:
     """
