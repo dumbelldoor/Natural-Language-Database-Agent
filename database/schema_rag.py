@@ -1,89 +1,143 @@
+import os
+import hashlib
+from dotenv import load_dotenv
+load_dotenv(override=True)
 from sqlalchemy import text
-from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 from database.connection import engine
 from config import RAG_CONFIG
 
-# Initialize Embedding model via central config
-EMBEDDING_MODEL = RAG_CONFIG.get("embedding_model", "sentence-transformers/all-MiniLM-L6-v2")
-embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
+CACHE_DIR = os.path.join(os.path.dirname(__file__), ".faiss_cache")
 
-def extract_database_schema() -> list[Document]:
+embeddings = OpenAIEmbeddings(
+    model="text-embedding-3-small",
+    api_key=os.getenv("GITHUB_TOKEN"),
+    base_url="https://models.inference.ai.azure.com",
+)
+
+
+def _get_foreign_keys(conn) -> dict[str, list[str]]:
+    """Returns a dict mapping table_name -> list of FK description strings."""
+    fk_query = text("""
+        SELECT
+            tc.table_name,
+            kcu.column_name,
+            ccu.table_name AS foreign_table_name,
+            ccu.column_name AS foreign_column_name
+        FROM information_schema.table_constraints AS tc
+        JOIN information_schema.key_column_usage AS kcu
+            ON tc.constraint_name = kcu.constraint_name
+            AND tc.table_schema = kcu.table_schema
+        JOIN information_schema.constraint_column_usage AS ccu
+            ON ccu.constraint_name = tc.constraint_name
+            AND ccu.table_schema = tc.table_schema
+        WHERE tc.constraint_type = 'FOREIGN KEY'
+          AND tc.table_schema = 'public';
+    """)
+    rows = conn.execute(fk_query).fetchall()
+    fk_map: dict[str, list[str]] = {}
+    for row in rows:
+        table, col, ftable, fcol = row
+        fk_map.setdefault(table, []).append(
+            f"{col} -> {ftable}.{fcol}"
+        )
+    return fk_map
+
+
+def extract_full_schema() -> tuple[list[Document], str]:
     """
-    Connects to PostgreSQL, extracts the table names and column details,
-    and formats them as LangChain Documents for the vector store.
+    Extracts all table schemas with column types AND foreign key relationships.
+    Returns (documents, schema_hash) where the hash can detect schema changes.
     """
     documents = []
+    schema_text_all = []
+
     try:
         with engine.connect() as conn:
-            # 1. Get all public tables
-            tables_query = text("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public';")
-            tables = conn.execute(tables_query).fetchall()
+            fk_map = _get_foreign_keys(conn)
 
-            # 2. For each table, get its columns and data types
-            for table in tables:
-                table_name = table[0]
-                columns_query = text(f"""
-                    SELECT column_name, data_type 
-                    FROM information_schema.columns 
-                    WHERE table_name = '{table_name}';
-                """)
-                columns = conn.execute(columns_query).fetchall()
-                
-                # 3. Format into a clean text string for the LLM
-                schema_text = f"Table Name: {table_name}\nColumns:\n"
-                for col in columns:
-                    schema_text += f" - {col[0]} ({col[1]})\n"
-                
-                # 4. Create a LangChain Document
-                doc = Document(page_content=schema_text, metadata={"table_name": table_name})
-                documents.append(doc)
-                
-        return documents
+            tables_result = conn.execute(
+                text("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' ORDER BY table_name;")
+            ).fetchall()
+
+            for (table_name,) in tables_result:
+                cols_result = conn.execute(
+                    text("""
+                        SELECT column_name, data_type, is_nullable, column_default
+                        FROM information_schema.columns
+                        WHERE table_schema = 'public' AND table_name = :tname
+                        ORDER BY ordinal_position;
+                    """),
+                    {"tname": table_name}
+                ).fetchall()
+
+                schema_text = f"Table: {table_name}\nColumns:\n"
+                for col_name, data_type, nullable, default in cols_result:
+                    nullable_str = "" if nullable == "YES" else " NOT NULL"
+                    default_str = f" DEFAULT {default}" if default else ""
+                    schema_text += f"  - {col_name} ({data_type}{nullable_str}{default_str})\n"
+
+                fks = fk_map.get(table_name, [])
+                if fks:
+                    schema_text += "Foreign Keys:\n"
+                    for fk in fks:
+                        schema_text += f"  - {fk}\n"
+
+                schema_text_all.append(schema_text)
+                documents.append(Document(page_content=schema_text, metadata={"table_name": table_name}))
+
     except Exception as e:
         print(f"Error extracting schema: {e}")
-        return []
+        return [], ""
+
+    combined = "\n".join(schema_text_all)
+    schema_hash = hashlib.md5(combined.encode()).hexdigest()
+    return documents, schema_hash
+
+
+def _cache_path(schema_hash: str) -> str:
+    return os.path.join(CACHE_DIR, f"schema_{schema_hash}")
+
 
 def create_schema_vector_store() -> FAISS:
     """
-    Embeds the extracted database schemas into a local FAISS vector store.
+    Builds or loads a cached FAISS index from the live database schema.
+    The cache is invalidated automatically when the schema changes.
     """
-    docs = extract_database_schema()
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    docs, schema_hash = extract_full_schema()
+
     if not docs:
-        raise ValueError("No schema documents found. Is the database empty?")
-    
-    # Create and return the FAISS vector store
+        raise ValueError("No schema documents found. Is the database running and populated?")
+
+    cache_path = _cache_path(schema_hash)
+
+    if os.path.exists(cache_path):
+        print(f"Loading cached schema index ({schema_hash[:8]}...).")
+        return FAISS.load_local(cache_path, embeddings, allow_dangerous_deserialization=True)
+
+    print(f"Building new schema index ({len(docs)} tables)...")
     vector_store = FAISS.from_documents(docs, embeddings)
+    vector_store.save_local(cache_path)
     return vector_store
 
-# Initialize the vector store in memory when this module is loaded
-print("Initializing local FAISS vector store with DB schemas...")
+
+def get_full_schema_text() -> str:
+    """Returns the full schema of all tables as a single string (for small-schema DBs)."""
+    docs, _ = extract_full_schema()
+    return "\n\n".join(doc.page_content for doc in docs)
+
+
+print("Initializing schema vector store...")
 schema_vector_store = create_schema_vector_store()
 
-def get_relevant_schemas(user_query: str, k: int = 2) -> str:
+
+def get_relevant_schemas(user_query: str, k: int = 6) -> str:
     """
-    Takes a natural language query and returns the DDL/Schema for the top 'k' most relevant tables.
+    Returns the DDL + FK context for the top-k most relevant tables.
+    Uses k=6 by default to cover complex multi-table joins.
     """
     results = schema_vector_store.similarity_search(user_query, k=k)
-    
-    combined_schemas = "\n\n".join([doc.page_content for doc in results])
-    return combined_schemas
-
-# --- TEST BLOCK ---
-if __name__ == "__main__":
-    print("\nTesting RAG Schema Retrieval...")
-    
-    # Test Question 1: Should retrieve 'customers' and 'orders'
-    query_1 = "Show me the email addresses of all users who have a pending status."
-    print(f"\nUser Query: '{query_1}'")
-    print("Retrieved Schemas:")
-    print("-" * 40)
-    print(get_relevant_schemas(query_1, k=2))
-    
-    # Test Question 2: Should retrieve 'products' and 'order_items'
-    query_2 = "What is the total stock quantity of all electronics we sell?"
-    print(f"\nUser Query: '{query_2}'")
-    print("Retrieved Schemas:")
-    print("-" * 40)
-    print(get_relevant_schemas(query_2, k=1))
+    return "\n\n".join(doc.page_content for doc in results)

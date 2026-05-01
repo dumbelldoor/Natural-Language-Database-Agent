@@ -1,8 +1,11 @@
 import os
 import re
 import json
+import time
 from dotenv import load_dotenv
-load_dotenv(override=True) # This forces Python to use the newly saved token
+
+load_dotenv(override=True)
+
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from agent.state import AgentState
@@ -11,183 +14,218 @@ from database.connection import execute_query
 from database.query_rag import get_few_shot_examples
 from config import LLM_CONFIG
 
-# Initialize LLM using dynamically loaded configurations
+# ─── LLM client ───────────────────────────────────────────────
 llm = ChatOpenAI(
     model=LLM_CONFIG.get("model", "llama-3.3-70b-instruct"),
     api_key=os.getenv("GITHUB_TOKEN"),
-    base_url=LLM_CONFIG.get("base_url", "https://models.inference.ai.azure.com"), 
+    base_url=LLM_CONFIG.get("base_url", "https://models.inference.ai.azure.com"),
     temperature=LLM_CONFIG.get("temperature", 0.0),
+    max_tokens=LLM_CONFIG.get("max_tokens", 1024),
 )
 
+# ─── Retry helper ─────────────────────────────────────────────
+def _invoke_with_retry(chain, inputs: dict, max_retries: int = 3, base_delay: float = 2.0):
+    """
+    Invoke a LangChain chain with exponential backoff on transient errors.
+    Retries on rate-limits (429), server errors (5xx) and connection issues.
+    """
+    for attempt in range(max_retries):
+        try:
+            return chain.invoke(inputs)
+        except Exception as e:
+            err = str(e)
+            is_transient = any(code in err for code in ["429", "500", "502", "503", "timeout", "connection"])
+            if is_transient and attempt < max_retries - 1:
+                wait = base_delay * (2 ** attempt)
+                print(f"-> [Retry] Attempt {attempt + 1}/{max_retries} failed ({err[:60]}). Retrying in {wait:.0f}s…")
+                time.sleep(wait)
+            else:
+                raise
+    raise RuntimeError("Max retries exceeded")
+
+# ─── Prompts ──────────────────────────────────────────────────
+_SQL_SYSTEM = """You are an expert PostgreSQL query writer. Your ONLY job is to produce a single, \
+correct, executable PostgreSQL statement.
+
+STRICT OUTPUT RULES:
+- Output ONLY the raw SQL. No markdown fences, no explanation, no preamble.
+- End the query with a semicolon.
+- Use exact table and column names from the schemas — never invent names.
+- Use JOIN conditions based on the Foreign Keys listed in each schema.
+- GROUP BY every non-aggregate SELECT column.
+- Default LIMIT 500 unless the user specifies otherwise.
+- Use LOWER() for case-insensitive string comparisons.
+- Use ROUND(..., 2) for monetary values.
+- Use DATE_TRUNC / EXTRACT / TO_CHAR for date formatting."""
+
+_SQL_HUMAN = """DATABASE SCHEMAS (columns + foreign keys):
+{schemas}
+
+{examples}USER QUESTION: {query}
+{error_block}
+Write the PostgreSQL query now:"""
+
+_RESPONSE_SYSTEM = """You are a friendly data analyst presenting database query results to a business user.
+
+RULES:
+1. Answer the user's question directly in plain English — no SQL, no technical jargon.
+2. If the result contains a table of rows, include a clean markdown table (max 20 rows shown).
+3. Bold (**) the most important number or insight.
+4. Keep prose concise: 1–3 sentences of summary around the table.
+5. Do NOT repeat every row in prose — let the table speak.
+
+CHART RULE — append this JSON block at the very end (nothing after it) if the data has \
+trends, rankings or comparisons that would benefit from a chart:
+```json
+{{"chart_type": "bar", "x": "column_name", "y": "column_name"}}
+```
+Allowed types: "bar", "line", "scatter". Omit the block for single-value or text-only results."""
+
+
+# ─── Nodes ────────────────────────────────────────────────────
+
 def retrieve_schema(state: AgentState) -> dict:
-    """Node 1: Retrieves necessary table schemas AND historical Golden SQL examples."""
-    print("-> [Node: retrieve_schema] Finding relevant tables and historical examples...")
+    """Node 1: Fetch relevant table schemas + few-shot examples."""
+    print("-> [retrieve_schema] Finding relevant tables…")
     query = state["user_query"]
-    
-    schemas = get_relevant_schemas(query, k=3)
+    schemas  = get_relevant_schemas(query, k=6)
     examples = get_few_shot_examples(query, k=2)
-    
-    return {
-        "schemas": schemas, 
-        "few_shot_examples": examples
-    }
+    return {"schemas": schemas, "few_shot_examples": examples}
+
 
 def generate_sql(state: AgentState) -> dict:
-    """Node 2: Generates the PostgreSQL query using Schemas and Few-Shot Examples."""
-    print("-> [Node: generate_sql] Writing PostgreSQL query...")
-    query = state["user_query"]
-    schemas = state["schemas"]
+    """Node 2: Generate a PostgreSQL query with LLM (retry-safe)."""
+    print("-> [generate_sql] Writing query…")
+    query    = state["user_query"]
+    schemas  = state["schemas"]
     examples = state.get("few_shot_examples", "")
-    error = state.get("execution_error")
+    error    = state.get("execution_error")
 
-    # The prompt now dynamically injects the Golden Queries
-    prompt_str = """You are an expert Data Engineer writing PostgreSQL queries.
-    Based on the following user request and database schemas, write a valid PostgreSQL query.
-    Return ONLY the raw SQL query. Do not wrap it in markdown block quotes. Do not explain it.
-    
-    Schemas:
-    {schemas}
-    
-    {examples}
-    
-    User Request: {query}
-    """
+    examples_block = ""
+    if examples and examples != "No historical examples found.":
+        examples_block = f"SIMILAR QUERY EXAMPLES:\n{examples}\n\n"
+
+    error_block = ""
     if error:
-        print(f"-> [Self-Correction] Fixing previous error: {error}")
-        prompt_str += f"\nYour previous query failed with this error: {error}\nPlease fix the SQL query."
+        print(f"-> [Self-Correction] Previous error: {error}")
+        error_block = (
+            f"\nPREVIOUS ATTEMPT FAILED:\n{error}\n"
+            "Fix the query. Do not repeat the same mistake."
+        )
 
-    prompt = ChatPromptTemplate.from_template(prompt_str)
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", _SQL_SYSTEM),
+        ("human",  _SQL_HUMAN),
+    ])
     chain = prompt | llm
-    
-    # We must pass the new 'examples' variable into the chain invocation
-    response = chain.invoke({
-        "schemas": schemas, 
-        "examples": examples, 
-        "query": query
+
+    response = _invoke_with_retry(chain, {
+        "schemas":     schemas,
+        "examples":    examples_block,
+        "query":       query,
+        "error_block": error_block,
     })
-    
-    sql = response.content.strip().replace("```sql", "").replace("```", "").strip()
-    
+
+    sql = response.content.strip()
+    sql = re.sub(r"^```(?:sql)?\s*", "", sql, flags=re.IGNORECASE)
+    sql = re.sub(r"\s*```$", "", sql).strip()
+
     return {"generated_sql": sql, "execution_error": None}
+
+
 def check_approval(state: AgentState) -> dict:
-    """Node 3: Human-in-the-Loop Security. Detects if the query modifies data using rigorous regex and verifies syntax with a dry-run."""
+    """Node 3: HITL — detect & dry-run modifying queries."""
     sql = state.get("generated_sql", "").strip()
-    
-    # Use rigorous Regex with word boundaries for Modifying Keywords
-    modifying_keywords_pattern = re.compile(r'\b(INSERT|UPDATE|DELETE|CREATE|DROP|ALTER|TRUNCATE|REPLACE|GRANT|REVOKE)\b', re.IGNORECASE)
-    is_modifying = bool(modifying_keywords_pattern.search(sql))
-    
-    if is_modifying and not state.get("is_approved"):
-        print("-> [Node: check_approval] WARNING: Modifying query detected. Verifying syntactically via dry-run...")
-        # Run a Dry-Run Transaction to verify safe syntax before presenting to user
-        from database.connection import dry_run_query
-        dry_run_result = dry_run_query(sql)
-        
-        if dry_run_result.get("status") == "error":
-            print(f"-> [Node: check_approval] Dry run revealed SQL error ({dry_run_result['message']}). Bypassing human approval to allow auto-correction.")
-            return {"requires_approval": False} # The execute_sql node will fail this query and auto-correct!
-            
-        print("-> [Node: check_approval] Dry-run passed safely. Pausing for Human Approval.")
-        state["generated_sql"] = f"-- {dry_run_result.get('message', 'Dry run successful')}\n" + sql 
-        return {"requires_approval": True, "generated_sql": state["generated_sql"]}
-    
-    return {"requires_approval": False}
+
+    modifying = re.compile(
+        r'\b(INSERT|UPDATE|DELETE|CREATE|DROP|ALTER|TRUNCATE|REPLACE|GRANT|REVOKE)\b',
+        re.IGNORECASE
+    )
+    if not modifying.search(sql) or state.get("is_approved"):
+        return {"requires_approval": False}
+
+    print("-> [check_approval] Modifying query detected. Dry-running…")
+    from database.connection import dry_run_query
+    result = dry_run_query(sql)
+
+    if result.get("status") == "error":
+        print(f"-> [check_approval] Dry-run failed — routing to self-correction.")
+        return {"requires_approval": False}
+
+    annotated = f"-- {result.get('message', 'Dry run OK')}\n{sql}"
+    return {"requires_approval": True, "generated_sql": annotated}
+
 
 def execute_sql(state: AgentState) -> dict:
-    """Node 4: Safely executes the SQL and captures EXPLAIN metrics."""
+    """Node 4: Execute the SQL query against PostgreSQL."""
     if state.get("requires_approval") and not state.get("is_approved"):
         return {}
 
-    print("-> [Node: execute_sql] Running query on PostgreSQL database...")
-    sql = state["generated_sql"]
+    print("-> [execute_sql] Executing query…")
+    sql      = state["generated_sql"]
     attempts = state.get("correction_attempts", 0)
 
     result = execute_query(sql, include_explain=True)
 
     if result["status"] == "error":
-        print(f"-> [Node: execute_sql] Database Error encountered!")
-        return {
-            "execution_error": result["message"],
-            "correction_attempts": attempts + 1
-        }
-    
-    # FIX: If it's an UPDATE/INSERT, there is no 'data', just a 'message'. 
-    # We must pass this message to the LLM so it knows the action succeeded.
-    final_data = result.get("data")
-    if not final_data:
-        final_data = [{"database_response": result.get("message", "Action executed successfully.")}]
-    
+        print(f"-> [execute_sql] DB error: {result['message']}")
+        return {"execution_error": result["message"], "correction_attempts": attempts + 1}
+
+    data = result.get("data") or [{"result": result.get("message", "Executed successfully.")}]
     return {
-        "final_results": final_data,
+        "final_results":    data,
         "execution_metrics": result.get("execution_plan", []),
-        "execution_error": None
+        "execution_error":  None,
     }
 
+
 def generate_final_response(state: AgentState) -> dict:
-    """Node 5: Translates the raw JSON database results into plain English."""
-    print("-> [Node: generate_final_response] Translating results to natural language...")
-    query = state["user_query"]
-    results = state.get("final_results", [])
-    
-    # --- THE FIX: PREVENT CONTEXT WINDOW OVERLOAD ---
+    """Node 5: Translate raw results into a natural-language answer."""
+    print("-> [generate_final_response] Drafting response…")
+    query   = state["user_query"]
+    error   = state.get("execution_error")
+
+    if error and state.get("correction_attempts", 0) >= 3:
+        return {
+            "final_answer": (
+                f"I was unable to complete this query after 3 attempts.\n\n"
+                f"**Last error:**\n```\n{error}\n```\n\n"
+                "Please rephrase your question or verify the data exists."
+            ),
+            "chart_config": None,
+        }
+
+    results    = state.get("final_results", [])
     total_rows = len(results)
-    truncation_note = ""
-    
-    # If there are more than 15 rows, we slice the list to protect the LLM token limit
-    if total_rows > 15:
-        results = results[:15]
-        truncation_note = f"\n[CRITICAL NOTE: The database returned {total_rows} total rows, but only the top 15 are shown below. You MUST mention in your response that the output is limited to the first 15 out of {total_rows} total records.]"
-    
-    prompt = ChatPromptTemplate.from_template(
-        """You are a helpful AI assistant. 
-        The user asked: "{query}"
-        The database returned this raw data: {results} {truncation_note}
-        
-        Provide a clear, concise, natural language summary of the results. 
-        Do not mention SQL or database metrics. Just give the final answer.
-        
-        IMPORTANT DASHBOARD INSTRUCTION:
-        If the data returned contains trends over time, categorical comparisons, or numerical distributions that would visually benefit from a chart, you MUST append a JSON block at the very end of your response formatted exactly like this:
-        ```json
-        {{"chart_type": "bar", "x": "column_name", "y": "column_name"}}
-        ```
-        Allowed chart_types: "bar", "line", "scatter". Choose the single best one. Do NOT include this JSON if the data is a single value or text that cannot be meaningfully charted."""
-    )
+    trunc_note = ""
+
+    if total_rows > 20:
+        results    = results[:20]
+        trunc_note = f"\n\n> **Note:** Showing first 20 of **{total_rows}** total rows."
+
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", _RESPONSE_SYSTEM),
+        ("human",  "USER QUESTION: {query}\n\nDATA ({row_count} rows):\n{results}{trunc_note}"),
+    ])
     chain = prompt | llm
-    
-    # Pass the updated variables to the prompt
-    response = chain.invoke({
-        "query": query, 
-        "results": results, 
-        "truncation_note": truncation_note
+
+    response = _invoke_with_retry(chain, {
+        "query":      query,
+        "row_count":  total_rows,
+        "results":    json.dumps(results, default=str, indent=2),
+        "trunc_note": trunc_note,
     })
-    
-    content = response.content
+
+    content      = response.content
     chart_config = None
-    
-    # Parse out the optional chart_config JSON block
+
     match = re.search(r'```json\s*(\{.*?\})\s*```', content, re.DOTALL | re.IGNORECASE)
     if match:
         try:
             chart_config = json.loads(match.group(1))
-            content = content[:match.start()].strip() # Clean the UI response
-            print("-> [Node: generate_final_response] Chart Config extracted successfully.")
+            content      = content[:match.start()].strip()
+            print("-> [generate_final_response] Chart config extracted.")
         except Exception as e:
-            print(f"-> [Node: generate_final_response] Could not parse chart JSON: {e}")
-            
+            print(f"-> [generate_final_response] Chart parse failed: {e}")
+
     return {"final_answer": content, "chart_config": chart_config}
-# --- TEST BLOCK ---
-if __name__ == "__main__":
-    print("\nTesting LLM Connection and Node Logic...")
-    
-    # Let's mock a simple state to test the LLM generation specifically
-    mock_state = {
-        "user_query": "How many total products do we have in stock?",
-        "schemas": "Table Name: products\nColumns:\n - product_id (integer)\n - product_name (character varying)\n - stock_quantity (integer)",
-        "execution_error": None,
-        "is_approved": False
-    }
-    
-    # Test generation
-    output_state = generate_sql(mock_state)
-    print(f"\nGenerated SQL: {output_state['generated_sql']}")
