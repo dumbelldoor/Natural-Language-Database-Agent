@@ -589,3 +589,35 @@ button { cursor: pointer; border: none; background: transparent; font-family: in
 .trial-exhausted p { font-size: 0.72rem; color: var(--text-muted); }
 
 .input-box.is-disabled { opacity: .5; pointer-events: none; }
+
+/* ── Upload format tags & status ── */
+.upload-hint {
+  font-size: 0.78rem;
+  color: var(--text-muted);
+}
+.upload-formats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  justify-content: center;
+  margin-top: 2px;
+}
+.upload-fmt-tag {
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: .03em;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: var(--bg-hover);
+  color: var(--text-muted);
+  pointer-events: none;
+}
+.upload-zone:hover .upload-fmt-tag,
+.upload-zone.dragging .upload-fmt-tag {
+  background: color-mix(in srgb, var(--accent) 15%, transparent);
+  color: var(--accent);
+}
+.upload-status-text {
+  font-size: 0.78rem;
+  color: var(--text-muted);
+}

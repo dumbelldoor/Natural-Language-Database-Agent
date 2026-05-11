@@ -236,36 +236,112 @@ const ChatMessage = ({ message, onRetry, onApprove, onReject }) => {
 // ─────────────────────────────────────────────
 // File Upload Component
 // ─────────────────────────────────────────────
+const ACCEPTED_FORMATS = [
+  { ext: '.csv',  label: 'CSV' },
+  { ext: '.xlsx', label: 'Excel' },
+  { ext: '.xls',  label: 'Excel 97' },
+  { ext: '.sql',  label: 'SQL' },
+];
+const ACCEPTED_EXTS = ACCEPTED_FORMATS.map(f => f.ext);
+
+async function warmUpServer() {
+  // Render free tier cold-starts in ~30-50 s. Ping health before uploading
+  // so we can show a friendly "waking up" message instead of a cryptic error.
+  const controller = new AbortController();
+  const tid = setTimeout(() => controller.abort(), 55_000);
+  try {
+    const res = await fetch(`${API_URL}/api/health`, { signal: controller.signal });
+    return res.ok;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(tid);
+  }
+}
+
 const FileUploadZone = ({ onUploaded, onClear, uploadedFile }) => {
-  const [dragging, setDragging] = useState(false);
-  const [uploading, setUploading] = useState(false);
-  const [error, setError]       = useState('');
+  const [dragging,  setDragging]  = useState(false);
+  const [status,    setStatus]    = useState('idle'); // idle | warmup | uploading
+  const [error,     setError]     = useState('');
   const fileRef = useRef(null);
 
   const handleFile = async (file) => {
-    const allowed = ['.csv', '.xlsx', '.xls', '.sql'];
-    const ext     = file.name.slice(file.name.lastIndexOf('.')).toLowerCase();
-    if (!allowed.includes(ext)) { setError(`Unsupported type. Use: ${allowed.join(', ')}`); return; }
-    if (file.size > 10 * 1024 * 1024) { setError('File too large (max 10 MB).'); return; }
+    const ext = (file.name.includes('.')
+      ? file.name.slice(file.name.lastIndexOf('.')).toLowerCase()
+      : '');
+
+    if (!ACCEPTED_EXTS.includes(ext)) {
+      setError(`Unsupported format "${ext || 'none'}". Upload a CSV, Excel, or SQL file.`);
+      return;
+    }
+    if (file.size > 10 * 1024 * 1024) {
+      setError('File too large — maximum size is 10 MB.');
+      return;
+    }
 
     setError('');
-    setUploading(true);
-    try {
-      const form = new FormData();
-      form.append('file', file);
-      const res  = await fetch(`${API_URL}/api/upload`, { method: 'POST', body: form });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.detail || 'Upload failed');
-      onUploaded({ sessionId: data.session_id, filename: file.name, schema: data.schema, tableName: data.table_name, sample: data.sample });
-    } catch (e) {
-      setError(e.message);
-    } finally {
-      setUploading(false);
+
+    // ── Step 1: warm up the server (handles Render cold-start) ──────────────
+    setStatus('warmup');
+    const alive = await warmUpServer();
+    if (!alive) {
+      setStatus('idle');
+      setError('Server is unreachable. Check your connection or try again in a moment.');
+      return;
     }
+
+    // ── Step 2: upload with one automatic retry ──────────────────────────────
+    setStatus('uploading');
+    const MAX = 2;
+    let lastErr = '';
+
+    for (let attempt = 1; attempt <= MAX; attempt++) {
+      try {
+        const form = new FormData();
+        form.append('file', file);
+
+        const controller = new AbortController();
+        const tid = setTimeout(() => controller.abort(), 60_000); // 60 s upload timeout
+
+        const res  = await fetch(`${API_URL}/api/upload`, { method: 'POST', body: form, signal: controller.signal });
+        clearTimeout(tid);
+
+        let data;
+        try { data = await res.json(); } catch { data = {}; }
+
+        if (!res.ok) {
+          lastErr = data.detail || `Server returned ${res.status}`;
+          if (attempt < MAX) { await new Promise(r => setTimeout(r, 1500)); continue; }
+          throw new Error(lastErr);
+        }
+
+        onUploaded({
+          sessionId:  data.session_id,
+          filename:   file.name,
+          schema:     data.schema,
+          tableName:  data.table_name,
+          sample:     data.sample,
+        });
+        setStatus('idle');
+        return;
+
+      } catch (e) {
+        lastErr = e.name === 'AbortError'
+          ? 'Upload timed out. Try a smaller file or try again.'
+          : (e.message === 'Failed to fetch'
+              ? 'Could not reach server. It may still be starting — try again in 10 seconds.'
+              : e.message);
+        if (attempt < MAX) { await new Promise(r => setTimeout(r, 1500)); }
+      }
+    }
+
+    setError(lastErr);
+    setStatus('idle');
   };
 
   const onDrop = (e) => {
-    e.preventDefault(); setDragging(false);
+    e.preventDefault();
+    setDragging(false);
     const file = e.dataTransfer.files[0];
     if (file) handleFile(file);
   };
@@ -283,19 +359,37 @@ const FileUploadZone = ({ onUploaded, onClear, uploadedFile }) => {
     );
   }
 
+  const isBusy = status !== 'idle';
   return (
     <div
-      className={`upload-zone ${dragging ? 'dragging' : ''} ${uploading ? 'uploading' : ''}`}
+      className={`upload-zone ${dragging ? 'dragging' : ''} ${isBusy ? 'uploading' : ''}`}
       onDragOver={e => { e.preventDefault(); setDragging(true); }}
       onDragLeave={() => setDragging(false)}
       onDrop={onDrop}
-      onClick={() => fileRef.current?.click()}
+      onClick={() => !isBusy && fileRef.current?.click()}
     >
-      <input ref={fileRef} type="file" accept=".csv,.xlsx,.xls,.sql" style={{ display: 'none' }}
-        onChange={e => e.target.files[0] && handleFile(e.target.files[0])} />
-      {uploading
-        ? <><Loader2 size={16} className="spin" /><span>Parsing file…</span></>
-        : <><Upload size={14} /><span>Drop CSV, XLSX, or SQL</span></>}
+      <input
+        ref={fileRef}
+        type="file"
+        accept={ACCEPTED_EXTS.join(',')}
+        style={{ display: 'none' }}
+        onChange={e => { if (e.target.files[0]) { handleFile(e.target.files[0]); e.target.value = ''; } }}
+      />
+
+      {status === 'warmup' && <><Loader2 size={15} className="spin" /><span className="upload-status-text">Waking up server…</span></>}
+      {status === 'uploading' && <><Loader2 size={15} className="spin" /><span className="upload-status-text">Parsing file…</span></>}
+      {status === 'idle' && (
+        <>
+          <Upload size={14} />
+          <span className="upload-hint">Click or drop a file</span>
+          <div className="upload-formats">
+            {ACCEPTED_FORMATS.map(f => (
+              <span key={f.ext} className="upload-fmt-tag">{f.label}</span>
+            ))}
+          </div>
+        </>
+      )}
+
       {error && <p className="upload-error">{error}</p>}
     </div>
   );
